@@ -1,0 +1,193 @@
+name: Qwopus3.5 9B 4bit MLX benchmark
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  benchmark:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --upgrade mlx mlx-lm huggingface_hub psutil
+
+      - name: Run Qwopus3.5 MLX benchmark with memory telemetry
+        run: |
+          set +e
+          cat > qwopus35_mlx_benchmark.py <<'PY'
+          import csv, inspect, json, os, platform, resource, signal, statistics, subprocess, sys, threading, time, traceback
+          from pathlib import Path
+          import psutil
+          from huggingface_hub import HfApi
+
+          MODEL_ID = 'Jackrong/MLX-Qwopus3.5-9B-v3-4bit'
+          RESULT_MD = Path('qwopus35-9b-4bit-mlx-results.md')
+          RESULT_JSON = Path('qwopus35-9b-4bit-mlx-results.json')
+          RESULT_CSV = Path('qwopus35-9b-4bit-mlx-results.csv')
+          LOG = Path('qwopus35-9b-4bit-mlx.log')
+          SAMPLES = Path('qwopus35-9b-4bit-mlx-memory-samples.jsonl')
+          process = psutil.Process(os.getpid())
+          samples = []
+          stop = threading.Event()
+          start_mono = time.perf_counter()
+
+          def sh(args):
+              try: return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT).strip()
+              except Exception as e: return f'unavailable: {e}'
+
+          def log(msg):
+              text = str(msg)
+              print(text, flush=True)
+              with LOG.open('a', encoding='utf-8') as f: f.write(text + '\n')
+
+          def mem(label):
+              try:
+                  mi = process.memory_info(); vm = psutil.virtual_memory(); sw = psutil.swap_memory(); ru = resource.getrusage(resource.RUSAGE_SELF)
+                  s = {
+                      't': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                      'elapsed_s': round(time.perf_counter() - start_mono, 3), 'label': label,
+                      'rss_gib': round(mi.rss / (1024**3), 4), 'vms_gib': round(mi.vms / (1024**3), 4),
+                      'ru_maxrss': ru.ru_maxrss, 'threads': process.num_threads(),
+                      'available_gib': round(vm.available / (1024**3), 4), 'used_gib': round(vm.used / (1024**3), 4),
+                      'total_gib': round(vm.total / (1024**3), 4), 'percent': vm.percent,
+                      'swap_used_gib': round(sw.used / (1024**3), 4), 'swap_percent': sw.percent,
+                  }
+                  samples.append(s)
+                  with SAMPLES.open('a', encoding='utf-8') as f: f.write(json.dumps(s) + '\n')
+                  log('MEM ' + ' '.join(f'{k}={v}' for k, v in s.items() if k != 't'))
+                  return s
+              except Exception as e:
+                  log(f'MEM_ERROR {label} {e!r}')
+
+          def monitor():
+              while not stop.is_set():
+                  mem('background_2s')
+                  stop.wait(2)
+
+          def enc_len(tok, text):
+              try: return len(tok.encode(text))
+              except Exception: return None
+
+          def save(result):
+              result['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+              result['memory_sample_count'] = len(samples)
+              if samples:
+                  result['peak_rss_gib'] = max(s['rss_gib'] for s in samples)
+                  result['min_available_gib'] = min(s['available_gib'] for s in samples)
+                  result['peak_swap_gib'] = max(s['swap_used_gib'] for s in samples)
+              RESULT_JSON.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
+              fields = ['name','prompt_label','prompt_tokens','max_tokens','repeat','status','elapsed_seconds','requested_tps','output_tokens','error','output_preview']
+              with RESULT_CSV.open('w', encoding='utf-8', newline='') as f:
+                  w = csv.DictWriter(f, fieldnames=fields); w.writeheader()
+                  for c in result.get('cases', []): w.writerow({k: c.get(k, '') for k in fields})
+              lines = [
+                  '# Qwopus3.5 9B 4-bit MLX benchmark', '',
+                  f"Status: `{result.get('status')}`", f"Model: `{MODEL_ID}`",
+                  f"Started: `{result.get('started_at')}`", f"Updated: `{result.get('updated_at')}`",
+                  f"Runner: `{result.get('runner')} {result.get('runner_os')} {result.get('runner_arch')}`",
+                  f"Platform: `{result.get('platform')}`", f"GitHub SHA: `{result.get('github_sha')}`",
+                  f"Model file GiB: `{result.get('model_file_gib')}`", f"Load seconds: `{result.get('load_seconds')}`",
+                  f"Peak RSS GiB: `{result.get('peak_rss_gib')}`", f"Min available GiB: `{result.get('min_available_gib')}`", f"Peak swap GiB: `{result.get('peak_swap_gib')}`",
+                  '', '## Cases', '| Case | Prompt tokens | Max tokens | Repeat | Status | Seconds | tok/s | Output tokens |', '|---|---:|---:|---:|---|---:|---:|---:|'
+              ]
+              for c in result.get('cases', []):
+                  lines.append(f"| {c.get('name')} | {c.get('prompt_tokens')} | {c.get('max_tokens')} | {c.get('repeat')} | {c.get('status')} | {c.get('elapsed_seconds')} | {c.get('requested_tps')} | {c.get('output_tokens')} |")
+              passed = [c for c in result.get('cases', []) if c.get('status') == 'passed']
+              if passed:
+                  best = max(passed, key=lambda c: c.get('requested_tps') or 0)
+                  lines += ['', '## Best case', '```json', json.dumps(best, indent=2), '```']
+              if result.get('error'): lines += ['', '## Error', '```text', str(result.get('error')), str(result.get('traceback','')), '```']
+              RESULT_MD.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+          class CaseTimeout(Exception): pass
+          def alarm_handler(signum, frame): raise CaseTimeout('case timed out')
+
+          for p in [LOG, SAMPLES]: p.write_text('', encoding='utf-8')
+          result = {'status': 'started', 'model_id': MODEL_ID, 'started_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                    'github_sha': os.environ.get('GITHUB_SHA'), 'github_run_id': os.environ.get('GITHUB_RUN_ID'), 'github_run_number': os.environ.get('GITHUB_RUN_NUMBER'),
+                    'runner': os.environ.get('RUNNER_NAME'), 'runner_os': os.environ.get('RUNNER_OS'), 'runner_arch': os.environ.get('RUNNER_ARCH'),
+                    'platform': platform.platform(), 'python_version': sys.version.replace('\n',' '), 'macos_version': sh(['sw_vers']),
+                    'sysctl_hw': sh(['bash','-lc','sysctl -n hw.memsize hw.ncpu hw.optional.arm64 2>/dev/null || true']), 'cases': []}
+          save(result)
+          threading.Thread(target=monitor, daemon=True).start()
+          try:
+              log(f'Benchmarking {MODEL_ID}'); log('sysctl_hw: ' + str(result['sysctl_hw']).replace('\n',' | ')); mem('initial')
+              info = HfApi().model_info(MODEL_ID, files_metadata=True)
+              model_bytes = sum(int(getattr(s, 'size', 0) or 0) for s in (getattr(info, 'siblings', []) or []) if (getattr(s, 'rfilename', '') or '').endswith(('.safetensors','.bin','.npz')) or 'model' in (getattr(s, 'rfilename', '') or '').lower() or (getattr(s, 'rfilename', '') or '') in {'config.json','tokenizer.json'})
+              result['model_file_bytes'] = model_bytes; result['model_file_gib'] = round(model_bytes/(1024**3), 4); result['hf_tags'] = getattr(info, 'tags', []) or []; save(result)
+              mem('before_import_mlx'); import mlx.core as mx; from mlx_lm import load, generate; mem('after_import_mlx')
+              kwargs = {}
+              try:
+                  if 'tokenizer_config' in inspect.signature(load).parameters: kwargs['tokenizer_config'] = {'fix_mistral_regex': True}
+              except Exception: pass
+              mem('before_load'); t0 = time.perf_counter(); model, tokenizer = load(MODEL_ID, **kwargs); mem('after_load_before_eval'); mx.eval(model.parameters()); mem('after_eval')
+              result['load_seconds'] = round(time.perf_counter() - t0, 4); result['mlx_device'] = str(mx.default_device()); result['status'] = 'loaded'; save(result)
+              prompts = {'tiny':'Hi.', 'short':'Say OK and one brief reason this model is running.', 'medium':'In one concise paragraph, explain whether a 5 GB quantized MLX model can run on a 7 GB GitHub Actions M1 runner.', 'long':'Discuss memory pressure for local LLM inference: model weights, KV cache, prompt length, output length, swap, and slowdowns. Keep it concise.'}
+              plan = [('warmup_1tok','tiny',1,1,90),('tiny_2tok','tiny',2,2,90),('short_8tok','short',8,2,120),('short_16tok','short',16,1,180),('short_32tok','short',32,1,240),('medium_prefill_1tok','medium',1,1,120),('medium_8tok','medium',8,1,180),('long_prefill_1tok','long',1,1,180)]
+              signal.signal(signal.SIGALRM, alarm_handler)
+              for name, plabel, max_tokens, repeats, timeout_s in plan:
+                  prompt = prompts[plabel]; ptoks = enc_len(tokenizer, prompt)
+                  for rep in range(1, repeats + 1):
+                      case = {'name': name, 'prompt_label': plabel, 'prompt_tokens': ptoks, 'max_tokens': max_tokens, 'repeat': rep, 'status': 'started'}
+                      result['cases'].append(case); save(result); mem(f'before_{name}_rep{rep}')
+                      try:
+                          signal.alarm(timeout_s); c0 = time.perf_counter(); out = generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=False); elapsed = time.perf_counter() - c0; signal.alarm(0); mem(f'after_{name}_rep{rep}')
+                          case.update({'status':'passed','elapsed_seconds':round(elapsed,4),'requested_tps':round(max_tokens/elapsed,4) if elapsed > 0 else None,'output_tokens':enc_len(tokenizer, str(out)),'output_preview':str(out)[:400]})
+                          log(f"CASE_PASS {name} rep={rep} seconds={case['elapsed_seconds']} tps={case['requested_tps']} output={case['output_preview'][:120].replace(chr(10),' | ')}")
+                      except BaseException as e:
+                          signal.alarm(0); mem(f'error_{name}_rep{rep}'); case.update({'status':'error','error':repr(e),'traceback':traceback.format_exc()}); log(f'CASE_ERROR {name} rep={rep} {e!r}')
+                      save(result)
+              passed = [c for c in result['cases'] if c.get('status') == 'passed']; result['passed_cases'] = len(passed); result['total_cases'] = len(result['cases']); result['status'] = 'finished'
+              if passed:
+                  vals = [c['requested_tps'] for c in passed if c.get('requested_tps') is not None]; result['avg_requested_tps'] = round(statistics.mean(vals),4); result['best_requested_tps'] = max(vals)
+              mem('final'); save(result)
+          except BaseException as e:
+              result['status'] = 'error_or_interrupted'; result['error'] = repr(e); result['traceback'] = traceback.format_exc(); log('TOP_LEVEL_ERROR ' + repr(e)); mem('top_level_error'); save(result)
+          finally:
+              stop.set(); result['finished_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()); mem('finally'); save(result); log('Wrote benchmark outputs')
+          PY
+          PYTHONUNBUFFERED=1 python qwopus35_mlx_benchmark.py
+          echo "python_exit=$?" | tee -a qwopus35-9b-4bit-mlx.log
+          exit 0
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qwopus35-mlx-benchmark-results
+          path: |
+            qwopus35-9b-4bit-mlx-results.md
+            qwopus35-9b-4bit-mlx-results.json
+            qwopus35-9b-4bit-mlx-results.csv
+            qwopus35-9b-4bit-mlx.log
+            qwopus35-9b-4bit-mlx-memory-samples.jsonl
+          if-no-files-found: warn
+
+      - name: Commit benchmark results back to repo
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add qwopus35-9b-4bit-mlx-results.md qwopus35-9b-4bit-mlx-results.json qwopus35-9b-4bit-mlx-results.csv qwopus35-9b-4bit-mlx.log qwopus35-9b-4bit-mlx-memory-samples.jsonl || true
+          git commit -m "Write Qwopus3.5 MLX benchmark results [skip ci]" || echo "No benchmark result changes to commit"
+          git pull --rebase || true
+          git push || echo "No benchmark result push performed"
