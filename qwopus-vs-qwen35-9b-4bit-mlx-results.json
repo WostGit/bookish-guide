@@ -1,0 +1,83 @@
+{
+  "status": "started",
+  "started_at": "2026-05-30T04:43:28Z",
+  "github_sha": "41903cea622c9a491d92203a62c0e883ebd13a09",
+  "github_run_id": "26674786621",
+  "github_run_number": "2",
+  "runner": "GitHub Actions 1000004790",
+  "runner_os": "macOS",
+  "runner_arch": "ARM64",
+  "platform": "macOS-26.4-arm64-arm-64bit",
+  "python_version": "3.11.9 (v3.11.9:de54cf5be3, Apr  2 2024, 07:12:50) [Clang 13.0.0 (clang-1300.0.29.30)]",
+  "macos_version": "ProductName:\t\tmacOS\nProductVersion:\t\t26.4\nBuildVersion:\t\t25E246",
+  "sysctl_hw": "7516192768\n3\n1",
+  "models": [
+    {
+      "label": "qwopus3.5_9b_4bit_mlx",
+      "model_id": "Jackrong/MLX-Qwopus3.5-9B-v3-4bit",
+      "status": "started",
+      "model_file_bytes": 5058234647,
+      "model_file_gib": 4.7108,
+      "hf_tags": [
+        "mlx",
+        "safetensors",
+        "qwen3_5",
+        "unsloth",
+        "qwen",
+        "qwen3.5",
+        "reasoning",
+        "chain-of-thought",
+        "lora",
+        "competitive-programming",
+        "text-generation",
+        "conversational",
+        "en",
+        "zh",
+        "ko",
+        "base_model:Jackrong/Qwopus3.5-9B-v3",
+        "base_model:adapter:Jackrong/Qwopus3.5-9B-v3",
+        "license:apache-2.0",
+        "4-bit",
+        "region:us"
+      ],
+      "files": [
+        {
+          "name": "config.json",
+          "size": 3157
+        },
+        {
+          "name": "model.safetensors",
+          "size": 5038160953
+        },
+        {
+          "name": "model.safetensors.index.json",
+          "size": 81194
+        },
+        {
+          "name": "tokenizer.json",
+          "size": 19989343
+        }
+      ]
+    }
+  ],
+  "cases": [],
+  "updated_at": "2026-05-30T04:43:28Z",
+  "memory_sample_count": 1,
+  "baseline_resolution": {
+    "baseline_id": "mlx-community/Qwen3.5-9B-4bit",
+    "method": "candidate_id",
+    "details": [
+      {
+        "model_id": "Jackrong/MLX-Qwen3.5-9B-v3-4bit",
+        "error": "RepositoryNotFoundError('401 Client Error. (Request ID: Root=1-6a1a6af0-429def4b055a2ad87693b55f;3d08c41a-294a-4ebc-ad04-70c7278c18ee)\\n\\nRepository Not Found for url: https://huggingface.co/api/models/Jackrong/MLX-Qwen3.5-9B-v3-4bit?blobs=true.\\nPlease make sure you specified the correct `repo_id` and `repo_type`.\\nIf you are trying to access a private or gated repo, make sure you are authenticated and your token has the required permissions.\\nFor more details, see https://huggingface.co/docs/huggingface_hub/authentication\\nInvalid username or password.')"
+      },
+      {
+        "model_id": "Jackrong/MLX-Qwen3.5-9B-4bit",
+        "error": "RepositoryNotFoundError('401 Client Error. (Request ID: Root=1-6a1a6af0-5d31eb8e3e515db02bc0c51d;dd488877-e718-4b48-a80d-c87e6c26dd5b)\\n\\nRepository Not Found for url: https://huggingface.co/api/models/Jackrong/MLX-Qwen3.5-9B-4bit?blobs=true.\\nPlease make sure you specified the correct `repo_id` and `repo_type`.\\nIf you are trying to access a private or gated repo, make sure you are authenticated and your token has the required permissions.\\nFor more details, see https://huggingface.co/docs/huggingface_hub/authentication\\nInvalid username or password.')"
+      }
+    ]
+  },
+  "peak_rss_gib": 0.0458,
+  "min_available_gib": 3.0968,
+  "peak_swap_gib": 0.0
+}
