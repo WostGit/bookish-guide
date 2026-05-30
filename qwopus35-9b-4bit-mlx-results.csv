@@ -1,0 +1,10 @@
+name,prompt_label,prompt_tokens,max_tokens,repeat,status,elapsed_seconds,requested_tps,output_tokens,error,output_preview
+warmup_1tok,tiny,2,1,1,passed,28.3886,0.0352,1,,I
+tiny_2tok,tiny,2,2,1,passed,11.8624,0.1686,2,,I have
+tiny_2tok,tiny,2,2,2,passed,1.96,1.0204,2,,I have
+short_8tok,short,11,8,1,passed,6.6425,1.2044,8,,"
+
+OK. This model is running because"
+medium_prefill_1tok,medium,30,1,1,passed,1.8534,0.5396,1,,"
+
+"
