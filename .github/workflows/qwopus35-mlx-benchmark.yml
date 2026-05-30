@@ -1,11 +1,9 @@
-name: Qwopus3.5 MLX Benchmark
+name: Compare Qwopus3.5 and Qwen3.5 MLX
 
 on:
   push:
     branches:
       - main
-  schedule:
-    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -13,12 +11,12 @@ permissions:
   actions: read
 
 concurrency:
-  group: qwopus35-mlx-benchmark
+  group: qwopus-qwen35-mlx-comparison
   cancel-in-progress: false
 
 jobs:
-  benchmark:
-    name: Benchmark Qwopus3.5 9B 4bit MLX
+  compare:
+    name: Compare Qwopus3.5 vs Qwen3.5 9B 4bit MLX
     runs-on: macos-26
     timeout-minutes: 120
 
@@ -38,12 +36,13 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --upgrade mlx mlx-lm huggingface_hub psutil
 
-      - name: Run Qwopus3.5 MLX benchmark
+      - name: Run MLX comparison benchmark
         shell: bash
         run: |
           set +e
-          cat > qwopus35_mlx_benchmark.py <<'PY'
+          cat > compare_qwopus_qwen35_mlx.py <<'PY'
           import csv
+          import gc
           import inspect
           import json
           import os
@@ -61,12 +60,19 @@ jobs:
           import psutil
           from huggingface_hub import HfApi
 
-          MODEL_ID = 'Jackrong/MLX-Qwopus3.5-9B-v3-4bit'
-          RESULT_MD = Path('qwopus35-9b-4bit-mlx-results.md')
-          RESULT_JSON = Path('qwopus35-9b-4bit-mlx-results.json')
-          RESULT_CSV = Path('qwopus35-9b-4bit-mlx-results.csv')
-          LOG = Path('qwopus35-9b-4bit-mlx.log')
-          SAMPLES = Path('qwopus35-9b-4bit-mlx-memory-samples.jsonl')
+          QWOPUS_MODEL = 'Jackrong/MLX-Qwopus3.5-9B-v3-4bit'
+          QWEN_BASELINE_CANDIDATES = [
+              'Jackrong/MLX-Qwen3.5-9B-v3-4bit',
+              'Jackrong/MLX-Qwen3.5-9B-4bit',
+              'mlx-community/Qwen3.5-9B-4bit',
+              'mlx-community/Qwen3.5-9B-Instruct-4bit',
+          ]
+
+          RESULT_MD = Path('qwopus-vs-qwen35-9b-4bit-mlx-results.md')
+          RESULT_JSON = Path('qwopus-vs-qwen35-9b-4bit-mlx-results.json')
+          RESULT_CSV = Path('qwopus-vs-qwen35-9b-4bit-mlx-results.csv')
+          LOG = Path('qwopus-vs-qwen35-9b-4bit-mlx.log')
+          SAMPLES = Path('qwopus-vs-qwen35-9b-4bit-mlx-memory-samples.jsonl')
 
           process = psutil.Process(os.getpid())
           samples = []
@@ -91,7 +97,7 @@ jobs:
                   vm = psutil.virtual_memory()
                   swap = psutil.swap_memory()
                   usage = resource.getrusage(resource.RUSAGE_SELF)
-                  sample = {
+                  item = {
                       'time': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                       'elapsed_seconds': round(time.perf_counter() - start_mono, 3),
                       'label': label,
@@ -106,10 +112,10 @@ jobs:
                       'swap_used_gib': round(swap.used / (1024 ** 3), 4),
                       'swap_percent': swap.percent,
                   }
-                  samples.append(sample)
+                  samples.append(item)
                   with SAMPLES.open('a', encoding='utf-8') as handle:
-                      handle.write(json.dumps(sample) + '\n')
-                  log('MEM ' + ' '.join(f'{k}={v}' for k, v in sample.items() if k != 'time'))
+                      handle.write(json.dumps(item) + '\n')
+                  log('MEM ' + ' '.join(f'{key}={value}' for key, value in item.items() if key != 'time'))
               except Exception as exc:
                   log(f'MEMORY_SAMPLE_ERROR label={label} error={exc!r}')
 
@@ -124,6 +130,42 @@ jobs:
               except Exception:
                   return None
 
+          def model_file_bytes(info):
+              total = 0
+              files = []
+              for sibling in getattr(info, 'siblings', []) or []:
+                  name = getattr(sibling, 'rfilename', '') or ''
+                  size = int(getattr(sibling, 'size', 0) or 0)
+                  if name.endswith(('.safetensors', '.bin', '.npz')) or 'model' in name.lower() or name in {'config.json', 'tokenizer.json'}:
+                      total += size
+                      files.append({'name': name, 'size': size})
+              return total, files
+
+          def resolve_qwen_baseline(api):
+              tried = []
+              for model_id in QWEN_BASELINE_CANDIDATES:
+                  try:
+                      info = api.model_info(model_id, files_metadata=True)
+                      return info.modelId, 'candidate_id', tried
+                  except Exception as exc:
+                      tried.append({'model_id': model_id, 'error': repr(exc)})
+              discovered = []
+              for author in ['Jackrong', 'mlx-community']:
+                  for query in ['Qwen3.5 9B 4bit MLX', 'Qwen3.5-9B-4bit', 'Qwen3.5 9B']:
+                      try:
+                          for model in api.list_models(author=author, search=query, full=True, limit=50):
+                              mid = model.modelId
+                              text = (mid + ' ' + ' '.join(getattr(model, 'tags', []) or [])).lower()
+                              discovered.append(mid)
+                              if 'qwopus' in text:
+                                  continue
+                              if 'qwen3.5' in text and '9b' in text and 'mlx' in text and ('4bit' in text or '4-bit' in text or '4_bit' in text):
+                                  return mid, f'discovered author={author} query={query}', tried
+                      except Exception as exc:
+                          tried.append({'author': author, 'query': query, 'error': repr(exc)})
+              tried.append({'discovered_model_ids': sorted(set(discovered))[:100]})
+              return None, 'not_found', tried
+
           def write_outputs(result):
               result['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
               result['memory_sample_count'] = len(samples)
@@ -132,34 +174,36 @@ jobs:
                   result['min_available_gib'] = min(s['available_gib'] for s in samples)
                   result['peak_swap_gib'] = max(s['swap_used_gib'] for s in samples)
               RESULT_JSON.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
-              columns = ['name', 'prompt_label', 'prompt_tokens', 'max_tokens', 'repeat', 'status', 'elapsed_seconds', 'requested_tps', 'output_tokens', 'error', 'output_preview']
+              columns = ['model_label', 'model_id', 'case_name', 'prompt_tokens', 'max_tokens', 'repeat', 'status', 'elapsed_seconds', 'requested_tps', 'output_tokens', 'error', 'output_preview']
               with RESULT_CSV.open('w', encoding='utf-8', newline='') as handle:
                   writer = csv.DictWriter(handle, fieldnames=columns)
                   writer.writeheader()
-                  for case in result.get('cases', []):
-                      writer.writerow({key: case.get(key, '') for key in columns})
+                  for row in result.get('cases', []):
+                      writer.writerow({key: row.get(key, '') for key in columns})
               lines = [
-                  '# Qwopus3.5 9B 4-bit MLX benchmark',
+                  '# Qwopus3.5 vs Qwen3.5 9B 4-bit MLX benchmark',
                   '',
                   f"Status: `{result.get('status')}`",
-                  f"Model: `{MODEL_ID}`",
                   f"Started: `{result.get('started_at')}`",
                   f"Updated: `{result.get('updated_at')}`",
                   f"Runner: `{result.get('runner')} {result.get('runner_os')} {result.get('runner_arch')}`",
                   f"Platform: `{result.get('platform')}`",
                   f"GitHub SHA: `{result.get('github_sha')}`",
-                  f"Model file GiB: `{result.get('model_file_gib')}`",
-                  f"Load seconds: `{result.get('load_seconds')}`",
                   f"Peak RSS GiB: `{result.get('peak_rss_gib')}`",
                   f"Min available GiB: `{result.get('min_available_gib')}`",
                   f"Peak swap GiB: `{result.get('peak_swap_gib')}`",
                   '',
-                  '## Cases',
-                  '| Case | Prompt tokens | Max tokens | Repeat | Status | Seconds | tok/s | Output tokens |',
-                  '|---|---:|---:|---:|---|---:|---:|---:|',
+                  '## Models',
+                  '| Label | Model ID | Status | File GiB | Load seconds | Best tok/s | Avg tok/s |',
+                  '|---|---|---|---:|---:|---:|---:|',
               ]
-              for case in result.get('cases', []):
-                  lines.append(f"| {case.get('name')} | {case.get('prompt_tokens')} | {case.get('max_tokens')} | {case.get('repeat')} | {case.get('status')} | {case.get('elapsed_seconds')} | {case.get('requested_tps')} | {case.get('output_tokens')} |")
+              for item in result.get('models', []):
+                  lines.append(f"| {item.get('label')} | `{item.get('model_id')}` | {item.get('status')} | {item.get('model_file_gib')} | {item.get('load_seconds')} | {item.get('best_requested_tps')} | {item.get('avg_requested_tps')} |")
+              lines.extend(['', '## Cases', '| Model | Case | Prompt tokens | Max tokens | Repeat | Status | Seconds | tok/s | Output tokens |', '|---|---|---:|---:|---:|---|---:|---:|---:|'])
+              for row in result.get('cases', []):
+                  lines.append(f"| {row.get('model_label')} | {row.get('case_name')} | {row.get('prompt_tokens')} | {row.get('max_tokens')} | {row.get('repeat')} | {row.get('status')} | {row.get('elapsed_seconds')} | {row.get('requested_tps')} | {row.get('output_tokens')} |")
+              if result.get('baseline_resolution'):
+                  lines.extend(['', '## Baseline resolution', '```json', json.dumps(result['baseline_resolution'], indent=2), '```'])
               if result.get('error'):
                   lines.extend(['', '## Error', '```text', str(result.get('error')), str(result.get('traceback', '')), '```'])
               RESULT_MD.write_text('\n'.join(lines) + '\n', encoding='utf-8')
@@ -170,12 +214,110 @@ jobs:
           def alarm_handler(signum, frame):
               raise CaseTimeout('case timed out')
 
+          def benchmark_model(model_label, model_id, api, result):
+              model_result = {'label': model_label, 'model_id': model_id, 'status': 'started'}
+              result['models'].append(model_result)
+              write_outputs(result)
+              try:
+                  info = api.model_info(model_id, files_metadata=True)
+                  total_bytes, files = model_file_bytes(info)
+                  model_result['model_file_bytes'] = total_bytes
+                  model_result['model_file_gib'] = round(total_bytes / (1024 ** 3), 4)
+                  model_result['hf_tags'] = getattr(info, 'tags', []) or []
+                  model_result['files'] = files[:40]
+                  write_outputs(result)
+
+                  sample_memory(f'before_import_mlx_{model_label}')
+                  import mlx.core as mx
+                  from mlx_lm import generate, load
+                  sample_memory(f'after_import_mlx_{model_label}')
+
+                  load_kwargs = {}
+                  try:
+                      if 'tokenizer_config' in inspect.signature(load).parameters:
+                          load_kwargs['tokenizer_config'] = {'fix_mistral_regex': True}
+                  except Exception:
+                      pass
+
+                  sample_memory(f'before_load_{model_label}')
+                  load_start = time.perf_counter()
+                  model, tokenizer = load(model_id, **load_kwargs)
+                  sample_memory(f'after_load_before_eval_{model_label}')
+                  mx.eval(model.parameters())
+                  sample_memory(f'after_eval_{model_label}')
+                  model_result['load_seconds'] = round(time.perf_counter() - load_start, 4)
+                  model_result['mlx_device'] = str(mx.default_device())
+                  model_result['status'] = 'loaded'
+                  write_outputs(result)
+
+                  prompts = {
+                      'tiny': 'Hi.',
+                      'short': 'Say OK and one brief reason this model is running.',
+                      'medium': 'In one concise paragraph, explain whether a 5 GB quantized MLX model can run on a 7 GB GitHub Actions M1 runner.',
+                  }
+                  plan = [
+                      ('warmup_1tok', 'tiny', 1, 1, 90),
+                      ('tiny_2tok', 'tiny', 2, 1, 90),
+                      ('short_8tok', 'short', 8, 1, 120),
+                      ('medium_prefill_1tok', 'medium', 1, 1, 120),
+                  ]
+                  case_values = []
+                  signal.signal(signal.SIGALRM, alarm_handler)
+                  for case_name, prompt_label, max_tokens, repeats, timeout_seconds in plan:
+                      prompt = prompts[prompt_label]
+                      prompt_tokens = encode_len(tokenizer, prompt)
+                      for repeat in range(1, repeats + 1):
+                          row = {'model_label': model_label, 'model_id': model_id, 'case_name': case_name, 'prompt_tokens': prompt_tokens, 'max_tokens': max_tokens, 'repeat': repeat, 'status': 'started'}
+                          result['cases'].append(row)
+                          write_outputs(result)
+                          sample_memory(f'before_{model_label}_{case_name}_rep{repeat}')
+                          try:
+                              signal.alarm(timeout_seconds)
+                              case_start = time.perf_counter()
+                              output = generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=False)
+                              elapsed = time.perf_counter() - case_start
+                              signal.alarm(0)
+                              sample_memory(f'after_{model_label}_{case_name}_rep{repeat}')
+                              tps = round(max_tokens / elapsed, 4) if elapsed > 0 else None
+                              row.update({'status': 'passed', 'elapsed_seconds': round(elapsed, 4), 'requested_tps': tps, 'output_tokens': encode_len(tokenizer, str(output)), 'output_preview': str(output)[:400]})
+                              if tps is not None:
+                                  case_values.append(tps)
+                              log(f"CASE_PASS model={model_label} case={case_name} seconds={row['elapsed_seconds']} tps={row['requested_tps']}")
+                          except BaseException as exc:
+                              signal.alarm(0)
+                              sample_memory(f'error_{model_label}_{case_name}_rep{repeat}')
+                              row.update({'status': 'error', 'error': repr(exc), 'traceback': traceback.format_exc()})
+                              log(f'CASE_ERROR model={model_label} case={case_name} error={exc!r}')
+                          write_outputs(result)
+                  if case_values:
+                      model_result['best_requested_tps'] = max(case_values)
+                      model_result['avg_requested_tps'] = round(statistics.mean(case_values), 4)
+                  model_result['passed_cases'] = sum(1 for row in result['cases'] if row.get('model_label') == model_label and row.get('status') == 'passed')
+                  model_result['total_cases'] = sum(1 for row in result['cases'] if row.get('model_label') == model_label)
+                  model_result['status'] = 'finished'
+                  write_outputs(result)
+                  try:
+                      del model
+                      del tokenizer
+                      gc.collect()
+                      if hasattr(mx, 'metal') and hasattr(mx.metal, 'clear_cache'):
+                          mx.metal.clear_cache()
+                  except Exception:
+                      pass
+                  sample_memory(f'after_cleanup_{model_label}')
+              except BaseException as exc:
+                  model_result['status'] = 'error'
+                  model_result['error'] = repr(exc)
+                  model_result['traceback'] = traceback.format_exc()
+                  log(f'MODEL_ERROR model={model_label} id={model_id} error={exc!r}')
+                  sample_memory(f'model_error_{model_label}')
+                  write_outputs(result)
+
           for path in (LOG, SAMPLES):
               path.write_text('', encoding='utf-8')
 
           result = {
               'status': 'started',
-              'model_id': MODEL_ID,
               'started_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
               'github_sha': os.environ.get('GITHUB_SHA'),
               'github_run_id': os.environ.get('GITHUB_RUN_ID'),
@@ -187,102 +329,24 @@ jobs:
               'python_version': sys.version.replace('\n', ' '),
               'macos_version': sh(['sw_vers']),
               'sysctl_hw': sh(['bash', '-lc', 'sysctl -n hw.memsize hw.ncpu hw.optional.arm64 2>/dev/null || true']),
+              'models': [],
               'cases': [],
           }
           write_outputs(result)
           threading.Thread(target=monitor_loop, daemon=True).start()
-
           try:
-              log(f'Benchmarking {MODEL_ID}')
-              log('sysctl_hw: ' + str(result['sysctl_hw']).replace('\n', ' | '))
-              sample_memory('initial')
-
-              info = HfApi().model_info(MODEL_ID, files_metadata=True)
-              model_bytes = 0
-              for sibling in getattr(info, 'siblings', []) or []:
-                  name = getattr(sibling, 'rfilename', '') or ''
-                  size = int(getattr(sibling, 'size', 0) or 0)
-                  if name.endswith(('.safetensors', '.bin', '.npz')) or 'model' in name.lower() or name in {'config.json', 'tokenizer.json'}:
-                      model_bytes += size
-              result['model_file_bytes'] = model_bytes
-              result['model_file_gib'] = round(model_bytes / (1024 ** 3), 4)
-              result['hf_tags'] = getattr(info, 'tags', []) or []
+              api = HfApi()
+              log('Resolving Qwen3.5 baseline model')
+              baseline_id, resolution_method, resolution_details = resolve_qwen_baseline(api)
+              result['baseline_resolution'] = {'baseline_id': baseline_id, 'method': resolution_method, 'details': resolution_details}
               write_outputs(result)
-
-              sample_memory('before_import_mlx')
-              import mlx.core as mx
-              from mlx_lm import generate, load
-              sample_memory('after_import_mlx')
-
-              load_kwargs = {}
-              try:
-                  if 'tokenizer_config' in inspect.signature(load).parameters:
-                      load_kwargs['tokenizer_config'] = {'fix_mistral_regex': True}
-              except Exception:
-                  pass
-
-              sample_memory('before_load')
-              load_start = time.perf_counter()
-              model, tokenizer = load(MODEL_ID, **load_kwargs)
-              sample_memory('after_load_before_eval')
-              mx.eval(model.parameters())
-              sample_memory('after_eval')
-              result['load_seconds'] = round(time.perf_counter() - load_start, 4)
-              result['mlx_device'] = str(mx.default_device())
-              result['status'] = 'loaded'
-              write_outputs(result)
-
-              prompts = {
-                  'tiny': 'Hi.',
-                  'short': 'Say OK and one brief reason this model is running.',
-                  'medium': 'In one concise paragraph, explain whether a 5 GB quantized MLX model can run on a 7 GB GitHub Actions M1 runner.',
-              }
-              plan = [
-                  ('warmup_1tok', 'tiny', 1, 1, 90),
-                  ('tiny_2tok', 'tiny', 2, 2, 90),
-                  ('short_8tok', 'short', 8, 1, 120),
-                  ('medium_prefill_1tok', 'medium', 1, 1, 120),
-              ]
-              signal.signal(signal.SIGALRM, alarm_handler)
-              for name, prompt_label, max_tokens, repeats, timeout_seconds in plan:
-                  prompt = prompts[prompt_label]
-                  prompt_tokens = encode_len(tokenizer, prompt)
-                  for repeat in range(1, repeats + 1):
-                      case = {'name': name, 'prompt_label': prompt_label, 'prompt_tokens': prompt_tokens, 'max_tokens': max_tokens, 'repeat': repeat, 'status': 'started'}
-                      result['cases'].append(case)
-                      write_outputs(result)
-                      sample_memory(f'before_{name}_rep{repeat}')
-                      try:
-                          signal.alarm(timeout_seconds)
-                          case_start = time.perf_counter()
-                          output = generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=False)
-                          elapsed = time.perf_counter() - case_start
-                          signal.alarm(0)
-                          sample_memory(f'after_{name}_rep{repeat}')
-                          case.update({
-                              'status': 'passed',
-                              'elapsed_seconds': round(elapsed, 4),
-                              'requested_tps': round(max_tokens / elapsed, 4) if elapsed > 0 else None,
-                              'output_tokens': encode_len(tokenizer, str(output)),
-                              'output_preview': str(output)[:400],
-                          })
-                          log(f"CASE_PASS {name} repeat={repeat} seconds={case['elapsed_seconds']} tps={case['requested_tps']}")
-                      except BaseException as exc:
-                          signal.alarm(0)
-                          sample_memory(f'error_{name}_rep{repeat}')
-                          case.update({'status': 'error', 'error': repr(exc), 'traceback': traceback.format_exc()})
-                          log(f'CASE_ERROR {name} repeat={repeat} error={exc!r}')
-                      write_outputs(result)
-
-              passed = [case for case in result['cases'] if case.get('status') == 'passed']
-              result['passed_cases'] = len(passed)
-              result['total_cases'] = len(result['cases'])
+              benchmark_model('qwopus3.5_9b_4bit_mlx', QWOPUS_MODEL, api, result)
+              if baseline_id:
+                  benchmark_model('qwen3.5_9b_4bit_mlx', baseline_id, api, result)
+              else:
+                  result['models'].append({'label': 'qwen3.5_9b_4bit_mlx', 'model_id': None, 'status': 'not_found'})
+                  write_outputs(result)
               result['status'] = 'finished'
-              values = [case['requested_tps'] for case in passed if case.get('requested_tps') is not None]
-              if values:
-                  result['avg_requested_tps'] = round(statistics.mean(values), 4)
-                  result['best_requested_tps'] = max(values)
-              sample_memory('final')
               write_outputs(result)
           except BaseException as exc:
               result['status'] = 'error_or_interrupted'
@@ -296,33 +360,33 @@ jobs:
               result['finished_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
               sample_memory('finally')
               write_outputs(result)
-              log('Wrote benchmark outputs')
+              log('Wrote comparison benchmark outputs')
           PY
-          PYTHONUNBUFFERED=1 python qwopus35_mlx_benchmark.py
-          echo "python_exit=$?" | tee -a qwopus35-9b-4bit-mlx.log
+          PYTHONUNBUFFERED=1 python compare_qwopus_qwen35_mlx.py
+          echo "python_exit=$?" | tee -a qwopus-vs-qwen35-9b-4bit-mlx.log
           exit 0
 
-      - name: Upload benchmark artifacts
+      - name: Upload comparison artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: qwopus35-mlx-benchmark-results
+          name: qwopus-vs-qwen35-mlx-comparison-results
           path: |
-            qwopus35-9b-4bit-mlx-results.md
-            qwopus35-9b-4bit-mlx-results.json
-            qwopus35-9b-4bit-mlx-results.csv
-            qwopus35-9b-4bit-mlx.log
-            qwopus35-9b-4bit-mlx-memory-samples.jsonl
+            qwopus-vs-qwen35-9b-4bit-mlx-results.md
+            qwopus-vs-qwen35-9b-4bit-mlx-results.json
+            qwopus-vs-qwen35-9b-4bit-mlx-results.csv
+            qwopus-vs-qwen35-9b-4bit-mlx.log
+            qwopus-vs-qwen35-9b-4bit-mlx-memory-samples.jsonl
           if-no-files-found: warn
 
-      - name: Commit benchmark results back to repo
+      - name: Commit comparison results back to repo
         if: always()
         shell: bash
         run: |
           set +e
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add qwopus35-9b-4bit-mlx-results.md qwopus35-9b-4bit-mlx-results.json qwopus35-9b-4bit-mlx-results.csv qwopus35-9b-4bit-mlx.log qwopus35-9b-4bit-mlx-memory-samples.jsonl || true
-          git commit -m "Write Qwopus3.5 MLX benchmark results [skip ci]" || echo "No benchmark result changes to commit"
+          git add qwopus-vs-qwen35-9b-4bit-mlx-results.md qwopus-vs-qwen35-9b-4bit-mlx-results.json qwopus-vs-qwen35-9b-4bit-mlx-results.csv qwopus-vs-qwen35-9b-4bit-mlx.log qwopus-vs-qwen35-9b-4bit-mlx-memory-samples.jsonl || true
+          git commit -m "Write Qwopus vs Qwen3.5 MLX comparison results [skip ci]" || echo "No comparison result changes to commit"
           git pull --rebase || true
-          git push || echo "No benchmark result push performed"
+          git push || echo "No comparison result push performed"
