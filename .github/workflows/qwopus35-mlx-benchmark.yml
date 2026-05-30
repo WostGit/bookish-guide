@@ -1,10 +1,12 @@
 name: Qwopus3.5 MLX Benchmark
 
-'on':
-  workflow_dispatch:
+on:
   push:
     branches:
       - main
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -36,7 +38,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --upgrade mlx mlx-lm huggingface_hub psutil
 
-      - name: Run benchmark
+      - name: Run Qwopus3.5 MLX benchmark
         shell: bash
         run: |
           set +e
@@ -83,7 +85,7 @@ jobs:
               with LOG.open('a', encoding='utf-8') as handle:
                   handle.write(text + '\n')
 
-          def memory_sample(label):
+          def sample_memory(label):
               try:
                   info = process.memory_info()
                   vm = psutil.virtual_memory()
@@ -107,15 +109,13 @@ jobs:
                   samples.append(sample)
                   with SAMPLES.open('a', encoding='utf-8') as handle:
                       handle.write(json.dumps(sample) + '\n')
-                  log('MEM ' + ' '.join(f'{key}={value}' for key, value in sample.items() if key != 'time'))
-                  return sample
+                  log('MEM ' + ' '.join(f'{k}={v}' for k, v in sample.items() if k != 'time'))
               except Exception as exc:
                   log(f'MEMORY_SAMPLE_ERROR label={label} error={exc!r}')
-                  return None
 
           def monitor_loop():
               while not stop.is_set():
-                  memory_sample('background_2s')
+                  sample_memory('background_2s')
                   stop.wait(2)
 
           def encode_len(tokenizer, text):
@@ -124,27 +124,20 @@ jobs:
               except Exception:
                   return None
 
-          def save_outputs(result):
+          def write_outputs(result):
               result['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
               result['memory_sample_count'] = len(samples)
               if samples:
-                  result['peak_rss_gib'] = max(item['rss_gib'] for item in samples)
-                  result['min_available_gib'] = min(item['available_gib'] for item in samples)
-                  result['peak_swap_gib'] = max(item['swap_used_gib'] for item in samples)
-
+                  result['peak_rss_gib'] = max(s['rss_gib'] for s in samples)
+                  result['min_available_gib'] = min(s['available_gib'] for s in samples)
+                  result['peak_swap_gib'] = max(s['swap_used_gib'] for s in samples)
               RESULT_JSON.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
-
-              columns = [
-                  'name', 'prompt_label', 'prompt_tokens', 'max_tokens', 'repeat',
-                  'status', 'elapsed_seconds', 'requested_tps', 'output_tokens',
-                  'error', 'output_preview'
-              ]
+              columns = ['name', 'prompt_label', 'prompt_tokens', 'max_tokens', 'repeat', 'status', 'elapsed_seconds', 'requested_tps', 'output_tokens', 'error', 'output_preview']
               with RESULT_CSV.open('w', encoding='utf-8', newline='') as handle:
                   writer = csv.DictWriter(handle, fieldnames=columns)
                   writer.writeheader()
                   for case in result.get('cases', []):
                       writer.writerow({key: case.get(key, '') for key in columns})
-
               lines = [
                   '# Qwopus3.5 9B 4-bit MLX benchmark',
                   '',
@@ -166,15 +159,7 @@ jobs:
                   '|---|---:|---:|---:|---|---:|---:|---:|',
               ]
               for case in result.get('cases', []):
-                  lines.append(
-                      f"| {case.get('name')} | {case.get('prompt_tokens')} | {case.get('max_tokens')} | "
-                      f"{case.get('repeat')} | {case.get('status')} | {case.get('elapsed_seconds')} | "
-                      f"{case.get('requested_tps')} | {case.get('output_tokens')} |"
-                  )
-              passed = [case for case in result.get('cases', []) if case.get('status') == 'passed']
-              if passed:
-                  best = max(passed, key=lambda case: case.get('requested_tps') or 0)
-                  lines.extend(['', '## Best case', '```json', json.dumps(best, indent=2), '```'])
+                  lines.append(f"| {case.get('name')} | {case.get('prompt_tokens')} | {case.get('max_tokens')} | {case.get('repeat')} | {case.get('status')} | {case.get('elapsed_seconds')} | {case.get('requested_tps')} | {case.get('output_tokens')} |")
               if result.get('error'):
                   lines.extend(['', '## Error', '```text', str(result.get('error')), str(result.get('traceback', '')), '```'])
               RESULT_MD.write_text('\n'.join(lines) + '\n', encoding='utf-8')
@@ -185,7 +170,7 @@ jobs:
           def alarm_handler(signum, frame):
               raise CaseTimeout('case timed out')
 
-          for path in [LOG, SAMPLES]:
+          for path in (LOG, SAMPLES):
               path.write_text('', encoding='utf-8')
 
           result = {
@@ -204,15 +189,13 @@ jobs:
               'sysctl_hw': sh(['bash', '-lc', 'sysctl -n hw.memsize hw.ncpu hw.optional.arm64 2>/dev/null || true']),
               'cases': [],
           }
-          save_outputs(result)
-
-          monitor = threading.Thread(target=monitor_loop, daemon=True)
-          monitor.start()
+          write_outputs(result)
+          threading.Thread(target=monitor_loop, daemon=True).start()
 
           try:
               log(f'Benchmarking {MODEL_ID}')
               log('sysctl_hw: ' + str(result['sysctl_hw']).replace('\n', ' | '))
-              memory_sample('initial')
+              sample_memory('initial')
 
               info = HfApi().model_info(MODEL_ID, files_metadata=True)
               model_bytes = 0
@@ -224,12 +207,12 @@ jobs:
               result['model_file_bytes'] = model_bytes
               result['model_file_gib'] = round(model_bytes / (1024 ** 3), 4)
               result['hf_tags'] = getattr(info, 'tags', []) or []
-              save_outputs(result)
+              write_outputs(result)
 
-              memory_sample('before_import_mlx')
+              sample_memory('before_import_mlx')
               import mlx.core as mx
               from mlx_lm import generate, load
-              memory_sample('after_import_mlx')
+              sample_memory('after_import_mlx')
 
               load_kwargs = {}
               try:
@@ -238,69 +221,58 @@ jobs:
               except Exception:
                   pass
 
-              memory_sample('before_load')
+              sample_memory('before_load')
               load_start = time.perf_counter()
               model, tokenizer = load(MODEL_ID, **load_kwargs)
-              memory_sample('after_load_before_eval')
+              sample_memory('after_load_before_eval')
               mx.eval(model.parameters())
-              memory_sample('after_eval')
+              sample_memory('after_eval')
               result['load_seconds'] = round(time.perf_counter() - load_start, 4)
               result['mlx_device'] = str(mx.default_device())
               result['status'] = 'loaded'
-              save_outputs(result)
+              write_outputs(result)
 
               prompts = {
                   'tiny': 'Hi.',
                   'short': 'Say OK and one brief reason this model is running.',
                   'medium': 'In one concise paragraph, explain whether a 5 GB quantized MLX model can run on a 7 GB GitHub Actions M1 runner.',
-                  'long': 'Discuss memory pressure for local LLM inference: model weights, KV cache, prompt length, output length, swap, and slowdowns. Keep it concise.',
               }
               plan = [
                   ('warmup_1tok', 'tiny', 1, 1, 90),
                   ('tiny_2tok', 'tiny', 2, 2, 90),
-                  ('short_8tok', 'short', 8, 2, 120),
-                  ('short_16tok', 'short', 16, 1, 180),
+                  ('short_8tok', 'short', 8, 1, 120),
                   ('medium_prefill_1tok', 'medium', 1, 1, 120),
-                  ('medium_8tok', 'medium', 8, 1, 180),
               ]
               signal.signal(signal.SIGALRM, alarm_handler)
               for name, prompt_label, max_tokens, repeats, timeout_seconds in plan:
                   prompt = prompts[prompt_label]
                   prompt_tokens = encode_len(tokenizer, prompt)
                   for repeat in range(1, repeats + 1):
-                      case = {
-                          'name': name,
-                          'prompt_label': prompt_label,
-                          'prompt_tokens': prompt_tokens,
-                          'max_tokens': max_tokens,
-                          'repeat': repeat,
-                          'status': 'started',
-                      }
+                      case = {'name': name, 'prompt_label': prompt_label, 'prompt_tokens': prompt_tokens, 'max_tokens': max_tokens, 'repeat': repeat, 'status': 'started'}
                       result['cases'].append(case)
-                      save_outputs(result)
-                      memory_sample(f'before_{name}_rep{repeat}')
+                      write_outputs(result)
+                      sample_memory(f'before_{name}_rep{repeat}')
                       try:
                           signal.alarm(timeout_seconds)
                           case_start = time.perf_counter()
                           output = generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=False)
                           elapsed = time.perf_counter() - case_start
                           signal.alarm(0)
-                          memory_sample(f'after_{name}_rep{repeat}')
-                          preview = str(output)[:400]
+                          sample_memory(f'after_{name}_rep{repeat}')
                           case.update({
                               'status': 'passed',
                               'elapsed_seconds': round(elapsed, 4),
                               'requested_tps': round(max_tokens / elapsed, 4) if elapsed > 0 else None,
                               'output_tokens': encode_len(tokenizer, str(output)),
-                              'output_preview': preview,
+                              'output_preview': str(output)[:400],
                           })
                           log(f"CASE_PASS {name} repeat={repeat} seconds={case['elapsed_seconds']} tps={case['requested_tps']}")
                       except BaseException as exc:
                           signal.alarm(0)
-                          memory_sample(f'error_{name}_rep{repeat}')
+                          sample_memory(f'error_{name}_rep{repeat}')
                           case.update({'status': 'error', 'error': repr(exc), 'traceback': traceback.format_exc()})
                           log(f'CASE_ERROR {name} repeat={repeat} error={exc!r}')
-                      save_outputs(result)
+                      write_outputs(result)
 
               passed = [case for case in result['cases'] if case.get('status') == 'passed']
               result['passed_cases'] = len(passed)
@@ -310,20 +282,20 @@ jobs:
               if values:
                   result['avg_requested_tps'] = round(statistics.mean(values), 4)
                   result['best_requested_tps'] = max(values)
-              memory_sample('final')
-              save_outputs(result)
+              sample_memory('final')
+              write_outputs(result)
           except BaseException as exc:
               result['status'] = 'error_or_interrupted'
               result['error'] = repr(exc)
               result['traceback'] = traceback.format_exc()
               log('TOP_LEVEL_ERROR ' + repr(exc))
-              memory_sample('top_level_error')
-              save_outputs(result)
+              sample_memory('top_level_error')
+              write_outputs(result)
           finally:
               stop.set()
               result['finished_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-              memory_sample('finally')
-              save_outputs(result)
+              sample_memory('finally')
+              write_outputs(result)
               log('Wrote benchmark outputs')
           PY
           PYTHONUNBUFFERED=1 python qwopus35_mlx_benchmark.py
