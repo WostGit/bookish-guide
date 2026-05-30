@@ -1,4 +1,4 @@
-name: Compare Qwopus3.5 and Qwen3.5 MLX
+name: Evaluate Qwopus and Qwen on Qwopus datasets
 
 on:
   push:
@@ -11,15 +11,13 @@ permissions:
   actions: read
 
 concurrency:
-  group: qwopus-qwen35-mlx-comparison
+  group: qwopus-qwen-dataset-eval
   cancel-in-progress: false
 
 jobs:
-  compare:
-    name: Compare Qwopus3.5 vs Qwen3.5 9B 4bit MLX
+  dataset-eval:
     runs-on: macos-26
     timeout-minutes: 120
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -34,359 +32,377 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --upgrade mlx mlx-lm huggingface_hub psutil
+          python -m pip install --upgrade mlx mlx-lm mlx-vlm huggingface_hub datasets pandas pyarrow psutil
 
-      - name: Run MLX comparison benchmark
+      - name: Evaluate models on sampled dataset questions
         shell: bash
         run: |
           set +e
-          cat > compare_qwopus_qwen35_mlx.py <<'PY'
-          import csv
-          import gc
-          import inspect
-          import json
-          import os
-          import platform
-          import resource
-          import signal
-          import statistics
-          import subprocess
-          import sys
-          import threading
-          import time
-          import traceback
+          cat > eval_qwopus_qwen_datasets.py <<'PY'
+          import csv, gc, inspect, json, os, re, statistics, subprocess, sys, time, traceback
           from pathlib import Path
-
           import psutil
+          import pandas as pd
+          from datasets import load_dataset, Dataset
           from huggingface_hub import HfApi
 
-          QWOPUS_MODEL = 'Jackrong/MLX-Qwopus3.5-9B-v3-4bit'
-          QWEN_BASELINE_CANDIDATES = [
-              'Jackrong/MLX-Qwen3.5-9B-v3-4bit',
-              'Jackrong/MLX-Qwen3.5-9B-4bit',
-              'mlx-community/Qwen3.5-9B-4bit',
-              'mlx-community/Qwen3.5-9B-Instruct-4bit',
+          DATASETS = [
+              {
+                  'id': 'nohurry/Opus-4.6-Reasoning-3000x-filtered',
+                  'url': 'https://huggingface.co/datasets/nohurry/Opus-4.6-Reasoning-3000x-filtered',
+                  'kind': 'ds1',
+              },
+              {
+                  'id': 'Jackrong/Qwen3.5-reasoning-700x',
+                  'url': 'https://huggingface.co/datasets/Jackrong/Qwen3.5-reasoning-700x',
+                  'kind': 'ds2',
+              },
+              {
+                  'id': 'Roman1111111/claude-opus-4.6-10000x',
+                  'url': 'https://huggingface.co/datasets/Roman1111111/claude-opus-4.6-10000x',
+                  'kind': 'ds3',
+              },
           ]
+          MODELS = [
+              {'label': 'qwopus', 'id': 'Jackrong/MLX-Qwopus3.5-9B-v3-4bit', 'backend': 'mlx_lm'},
+              {'label': 'qwen', 'id': 'mlx-community/Qwen3.5-9B-4bit', 'backend': 'auto'},
+          ]
+          SAMPLE_PER_DATASET = 1
+          MAX_NEW_TOKENS = 64
+          SEED = 12181531
 
-          RESULT_MD = Path('qwopus-vs-qwen35-9b-4bit-mlx-results.md')
-          RESULT_JSON = Path('qwopus-vs-qwen35-9b-4bit-mlx-results.json')
-          RESULT_CSV = Path('qwopus-vs-qwen35-9b-4bit-mlx-results.csv')
-          LOG = Path('qwopus-vs-qwen35-9b-4bit-mlx.log')
-          SAMPLES = Path('qwopus-vs-qwen35-9b-4bit-mlx-memory-samples.jsonl')
+          OUT_MD = Path('qwopus-qwen-dataset-eval-results.md')
+          OUT_JSON = Path('qwopus-qwen-dataset-eval-results.json')
+          OUT_CSV = Path('qwopus-qwen-dataset-eval-results.csv')
+          LOG = Path('qwopus-qwen-dataset-eval.log')
 
-          process = psutil.Process(os.getpid())
-          samples = []
-          stop = threading.Event()
-          start_mono = time.perf_counter()
+          def log(msg):
+              text = str(msg)
+              print(text, flush=True)
+              with LOG.open('a', encoding='utf-8') as f:
+                  f.write(text + '\n')
 
           def sh(args):
               try:
                   return subprocess.check_output(args, text=True, stderr=subprocess.STDOUT).strip()
-              except Exception as exc:
-                  return f'unavailable: {exc}'
+              except Exception as e:
+                  return f'unavailable: {e}'
 
-          def log(message):
-              text = str(message)
-              print(text, flush=True)
-              with LOG.open('a', encoding='utf-8') as handle:
-                  handle.write(text + '\n')
+          def norm_text(x):
+              return re.sub(r'\s+', ' ', str(x or '')).strip()
 
-          def sample_memory(label):
+          def normalize_for_score(x):
+              x = norm_text(x).lower()
+              x = re.sub(r'<think>.*?</think>', ' ', x, flags=re.S)
+              x = re.sub(r'[^a-z0-9\.\-]+', ' ', x)
+              return re.sub(r'\s+', ' ', x).strip()
+
+          def token_f1(pred, ref):
+              p = normalize_for_score(pred).split()
+              r = normalize_for_score(ref).split()
+              if not p or not r:
+                  return 0.0
+              common = {}
+              for t in r:
+                  common[t] = common.get(t, 0) + 1
+              overlap = 0
+              for t in p:
+                  if common.get(t, 0) > 0:
+                      overlap += 1
+                      common[t] -= 1
+              if overlap == 0:
+                  return 0.0
+              precision = overlap / len(p)
+              recall = overlap / len(r)
+              return round(2 * precision * recall / (precision + recall), 4)
+
+          def contains_answer(pred, ref):
+              p = normalize_for_score(pred)
+              r = normalize_for_score(ref)
+              if not p or not r:
+                  return False
+              # Use final short line / answer-ish suffix if available.
+              tail = r[-200:]
+              nums = re.findall(r'-?\d+(?:\.\d+)?', tail)
+              if nums:
+                  return any(n in p for n in nums[-3:])
+              words = [w for w in tail.split() if len(w) > 3]
+              if not words:
+                  return False
+              return sum(1 for w in words[:20] if w in p) >= max(1, min(3, len(words[:20]) // 3))
+
+          def load_ds3_parquet():
+              path = 'hf://datasets/Roman1111111/claude-opus-4.6-10000x@refs/convert/parquet/default/train/0000.parquet'
+              return Dataset.from_pandas(pd.read_parquet(path), preserve_index=False)
+
+          def load_any_dataset(dataset_id):
               try:
-                  info = process.memory_info()
-                  vm = psutil.virtual_memory()
-                  swap = psutil.swap_memory()
-                  usage = resource.getrusage(resource.RUSAGE_SELF)
-                  item = {
-                      'time': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-                      'elapsed_seconds': round(time.perf_counter() - start_mono, 3),
-                      'label': label,
-                      'rss_gib': round(info.rss / (1024 ** 3), 4),
-                      'vms_gib': round(info.vms / (1024 ** 3), 4),
-                      'max_rss': usage.ru_maxrss,
-                      'threads': process.num_threads(),
-                      'total_gib': round(vm.total / (1024 ** 3), 4),
-                      'available_gib': round(vm.available / (1024 ** 3), 4),
-                      'used_gib': round(vm.used / (1024 ** 3), 4),
-                      'percent': vm.percent,
-                      'swap_used_gib': round(swap.used / (1024 ** 3), 4),
-                      'swap_percent': swap.percent,
-                  }
-                  samples.append(item)
-                  with SAMPLES.open('a', encoding='utf-8') as handle:
-                      handle.write(json.dumps(item) + '\n')
-                  log('MEM ' + ' '.join(f'{key}={value}' for key, value in item.items() if key != 'time'))
-              except Exception as exc:
-                  log(f'MEMORY_SAMPLE_ERROR label={label} error={exc!r}')
+                  return load_dataset(dataset_id, split='train')
+              except Exception as e:
+                  if dataset_id == 'Roman1111111/claude-opus-4.6-10000x':
+                      log('Using parquet fallback for ds3 after load_dataset error: ' + repr(e))
+                      return load_ds3_parquet()
+                  raise
 
-          def monitor_loop():
-              while not stop.is_set():
-                  sample_memory('background_2s')
-                  stop.wait(2)
-
-          def encode_len(tokenizer, text):
-              try:
-                  return len(tokenizer.encode(text))
-              except Exception:
-                  return None
-
-          def model_file_bytes(info):
-              total = 0
-              files = []
-              for sibling in getattr(info, 'siblings', []) or []:
-                  name = getattr(sibling, 'rfilename', '') or ''
-                  size = int(getattr(sibling, 'size', 0) or 0)
-                  if name.endswith(('.safetensors', '.bin', '.npz')) or 'model' in name.lower() or name in {'config.json', 'tokenizer.json'}:
-                      total += size
-                      files.append({'name': name, 'size': size})
-              return total, files
-
-          def resolve_qwen_baseline(api):
-              tried = []
-              for model_id in QWEN_BASELINE_CANDIDATES:
+          def parse_message_item(m):
+              if isinstance(m, dict):
+                  return m
+              if isinstance(m, str):
                   try:
-                      info = api.model_info(model_id, files_metadata=True)
-                      return info.modelId, 'candidate_id', tried
-                  except Exception as exc:
-                      tried.append({'model_id': model_id, 'error': repr(exc)})
-              discovered = []
-              for author in ['Jackrong', 'mlx-community']:
-                  for query in ['Qwen3.5 9B 4bit MLX', 'Qwen3.5-9B-4bit', 'Qwen3.5 9B']:
-                      try:
-                          for model in api.list_models(author=author, search=query, full=True, limit=50):
-                              mid = model.modelId
-                              text = (mid + ' ' + ' '.join(getattr(model, 'tags', []) or [])).lower()
-                              discovered.append(mid)
-                              if 'qwopus' in text:
-                                  continue
-                              if 'qwen3.5' in text and '9b' in text and 'mlx' in text and ('4bit' in text or '4-bit' in text or '4_bit' in text):
-                                  return mid, f'discovered author={author} query={query}', tried
-                      except Exception as exc:
-                          tried.append({'author': author, 'query': query, 'error': repr(exc)})
-              tried.append({'discovered_model_ids': sorted(set(discovered))[:100]})
-              return None, 'not_found', tried
+                      obj = json.loads(m)
+                      return obj if isinstance(obj, dict) else None
+                  except Exception:
+                      return None
+              return None
 
-          def write_outputs(result):
+          def ds1_to_qa(row):
+              q = norm_text(row.get('problem'))
+              ref = norm_text(row.get('solution'))
+              if not ref:
+                  ref = norm_text(row.get('thinking'))
+              return q, ref
+
+          def ds2_to_qa(row):
+              conv = row.get('conversation') or []
+              user = None
+              assistant = None
+              for m in conv:
+                  if not isinstance(m, dict):
+                      continue
+                  role = (m.get('from') or '').strip()
+                  val = norm_text(m.get('value'))
+                  if role == 'human':
+                      user = val
+                  elif role == 'gpt' and user:
+                      assistant = val
+              return user, assistant
+
+          def ds3_to_qa(row):
+              raw = row.get('messages') or []
+              msgs = []
+              for m in raw:
+                  pm = parse_message_item(m)
+                  if pm:
+                      msgs.append(pm)
+              user = None
+              assistant = None
+              for m in msgs:
+                  role = m.get('role')
+                  content = norm_text(m.get('content'))
+                  reasoning = norm_text(m.get('reasoning'))
+                  if role == 'user':
+                      user = content
+                  elif role == 'assistant' and user:
+                      assistant = (('<think>' + reasoning + '</think>\n') if reasoning else '') + content
+              return user, assistant
+
+          def build_samples():
+              samples = []
+              for spec in DATASETS:
+                  ds = load_any_dataset(spec['id'])
+                  ds = ds.shuffle(seed=SEED)
+                  added = 0
+                  for row in ds:
+                      if spec['kind'] == 'ds1':
+                          q, ref = ds1_to_qa(row)
+                      elif spec['kind'] == 'ds2':
+                          q, ref = ds2_to_qa(row)
+                      else:
+                          q, ref = ds3_to_qa(row)
+                      if q and ref and len(q) < 4000:
+                          samples.append({
+                              'dataset_id': spec['id'],
+                              'dataset_url': spec['url'],
+                              'question': q,
+                              'reference': ref,
+                          })
+                          added += 1
+                      if added >= SAMPLE_PER_DATASET:
+                          break
+              return samples
+
+          def save(result):
               result['updated_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-              result['memory_sample_count'] = len(samples)
-              if samples:
-                  result['peak_rss_gib'] = max(s['rss_gib'] for s in samples)
-                  result['min_available_gib'] = min(s['available_gib'] for s in samples)
-                  result['peak_swap_gib'] = max(s['swap_used_gib'] for s in samples)
-              RESULT_JSON.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
-              columns = ['model_label', 'model_id', 'case_name', 'prompt_tokens', 'max_tokens', 'repeat', 'status', 'elapsed_seconds', 'requested_tps', 'output_tokens', 'error', 'output_preview']
-              with RESULT_CSV.open('w', encoding='utf-8', newline='') as handle:
-                  writer = csv.DictWriter(handle, fieldnames=columns)
-                  writer.writeheader()
-                  for row in result.get('cases', []):
-                      writer.writerow({key: row.get(key, '') for key in columns})
+              OUT_JSON.write_text(json.dumps(result, indent=2) + '\n', encoding='utf-8')
+              cols = ['model_label','model_id','dataset_id','status','elapsed_seconds','token_f1','contains_answer','question','reference','prediction','error']
+              with OUT_CSV.open('w', encoding='utf-8', newline='') as f:
+                  w = csv.DictWriter(f, fieldnames=cols)
+                  w.writeheader()
+                  for r in result.get('evaluations', []):
+                      w.writerow({c: r.get(c, '') for c in cols})
               lines = [
-                  '# Qwopus3.5 vs Qwen3.5 9B 4-bit MLX benchmark',
-                  '',
+                  '# Qwopus vs Qwen dataset evaluation', '',
                   f"Status: `{result.get('status')}`",
                   f"Started: `{result.get('started_at')}`",
                   f"Updated: `{result.get('updated_at')}`",
                   f"Runner: `{result.get('runner')} {result.get('runner_os')} {result.get('runner_arch')}`",
-                  f"Platform: `{result.get('platform')}`",
-                  f"GitHub SHA: `{result.get('github_sha')}`",
-                  f"Peak RSS GiB: `{result.get('peak_rss_gib')}`",
-                  f"Min available GiB: `{result.get('min_available_gib')}`",
-                  f"Peak swap GiB: `{result.get('peak_swap_gib')}`",
-                  '',
-                  '## Models',
-                  '| Label | Model ID | Status | File GiB | Load seconds | Best tok/s | Avg tok/s |',
-                  '|---|---|---|---:|---:|---:|---:|',
+                  f"Platform: `{result.get('platform')}`", '',
+                  '## Dataset URLs',
               ]
-              for item in result.get('models', []):
-                  lines.append(f"| {item.get('label')} | `{item.get('model_id')}` | {item.get('status')} | {item.get('model_file_gib')} | {item.get('load_seconds')} | {item.get('best_requested_tps')} | {item.get('avg_requested_tps')} |")
-              lines.extend(['', '## Cases', '| Model | Case | Prompt tokens | Max tokens | Repeat | Status | Seconds | tok/s | Output tokens |', '|---|---|---:|---:|---:|---|---:|---:|---:|'])
-              for row in result.get('cases', []):
-                  lines.append(f"| {row.get('model_label')} | {row.get('case_name')} | {row.get('prompt_tokens')} | {row.get('max_tokens')} | {row.get('repeat')} | {row.get('status')} | {row.get('elapsed_seconds')} | {row.get('requested_tps')} | {row.get('output_tokens')} |")
-              if result.get('baseline_resolution'):
-                  lines.extend(['', '## Baseline resolution', '```json', json.dumps(result['baseline_resolution'], indent=2), '```'])
-              if result.get('error'):
-                  lines.extend(['', '## Error', '```text', str(result.get('error')), str(result.get('traceback', '')), '```'])
-              RESULT_MD.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+              for d in DATASETS:
+                  lines.append(f"- `{d['id']}`: {d['url']}")
+              lines += ['', '## Model summary', '| Model | Status | Avg token-F1 | Contains-answer rate | Cases |', '|---|---|---:|---:|---:|']
+              for m in result.get('models', []):
+                  lines.append(f"| {m.get('label')} `{m.get('id')}` | {m.get('status')} | {m.get('avg_token_f1')} | {m.get('contains_answer_rate')} | {m.get('cases')} |")
+              lines += ['', '## Case results', '| Model | Dataset | Status | Seconds | token-F1 | Contains answer |', '|---|---|---|---:|---:|---:|']
+              for r in result.get('evaluations', []):
+                  lines.append(f"| {r.get('model_label')} | `{r.get('dataset_id')}` | {r.get('status')} | {r.get('elapsed_seconds')} | {r.get('token_f1')} | {r.get('contains_answer')} |")
+              if result.get('notes'):
+                  lines += ['', '## Notes'] + [f"- {n}" for n in result['notes']]
+              OUT_MD.write_text('\n'.join(lines) + '\n', encoding='utf-8')
 
-          class CaseTimeout(Exception):
-              pass
-
-          def alarm_handler(signum, frame):
-              raise CaseTimeout('case timed out')
-
-          def benchmark_model(model_label, model_id, api, result):
-              model_result = {'label': model_label, 'model_id': model_id, 'status': 'started'}
-              result['models'].append(model_result)
-              write_outputs(result)
+          def load_mlx_lm_model(model_id):
+              import mlx.core as mx
+              from mlx_lm import generate, load
+              kwargs = {}
               try:
-                  info = api.model_info(model_id, files_metadata=True)
-                  total_bytes, files = model_file_bytes(info)
-                  model_result['model_file_bytes'] = total_bytes
-                  model_result['model_file_gib'] = round(total_bytes / (1024 ** 3), 4)
-                  model_result['hf_tags'] = getattr(info, 'tags', []) or []
-                  model_result['files'] = files[:40]
-                  write_outputs(result)
+                  if 'tokenizer_config' in inspect.signature(load).parameters:
+                      kwargs['tokenizer_config'] = {'fix_mistral_regex': True}
+              except Exception:
+                  pass
+              model, tokenizer = load(model_id, **kwargs)
+              mx.eval(model.parameters())
+              def gen(prompt, max_tokens):
+                  return generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=False)
+              return gen
 
-                  sample_memory(f'before_import_mlx_{model_label}')
-                  import mlx.core as mx
-                  from mlx_lm import generate, load
-                  sample_memory(f'after_import_mlx_{model_label}')
-
-                  load_kwargs = {}
+          def load_mlx_vlm_model(model_id):
+              from mlx_vlm import load, generate
+              from mlx_vlm.prompt_utils import apply_chat_template
+              from mlx_vlm.utils import load_config
+              model, processor = load(model_id)
+              config = load_config(model_id)
+              def gen(prompt, max_tokens):
+                  formatted = apply_chat_template(processor, config, prompt, num_images=0)
                   try:
-                      if 'tokenizer_config' in inspect.signature(load).parameters:
-                          load_kwargs['tokenizer_config'] = {'fix_mistral_regex': True}
-                  except Exception:
-                      pass
+                      return generate(model, processor, formatted, image=[], max_tokens=max_tokens)
+                  except TypeError:
+                      return generate(model, processor, formatted, [], max_tokens=max_tokens)
+              return gen
 
-                  sample_memory(f'before_load_{model_label}')
-                  load_start = time.perf_counter()
-                  model, tokenizer = load(model_id, **load_kwargs)
-                  sample_memory(f'after_load_before_eval_{model_label}')
-                  mx.eval(model.parameters())
-                  sample_memory(f'after_eval_{model_label}')
-                  model_result['load_seconds'] = round(time.perf_counter() - load_start, 4)
-                  model_result['mlx_device'] = str(mx.default_device())
-                  model_result['status'] = 'loaded'
-                  write_outputs(result)
+          def load_generator(model_spec):
+              errors = []
+              try:
+                  return load_mlx_lm_model(model_spec['id']), 'mlx_lm', errors
+              except Exception as e:
+                  errors.append({'backend': 'mlx_lm', 'error': repr(e)})
+              try:
+                  return load_mlx_vlm_model(model_spec['id']), 'mlx_vlm', errors
+              except Exception as e:
+                  errors.append({'backend': 'mlx_vlm', 'error': repr(e)})
+              raise RuntimeError(json.dumps(errors))
 
-                  prompts = {
-                      'tiny': 'Hi.',
-                      'short': 'Say OK and one brief reason this model is running.',
-                      'medium': 'In one concise paragraph, explain whether a 5 GB quantized MLX model can run on a 7 GB GitHub Actions M1 runner.',
-                  }
-                  plan = [
-                      ('warmup_1tok', 'tiny', 1, 1, 90),
-                      ('tiny_2tok', 'tiny', 2, 1, 90),
-                      ('short_8tok', 'short', 8, 1, 120),
-                      ('medium_prefill_1tok', 'medium', 1, 1, 120),
-                  ]
-                  case_values = []
-                  signal.signal(signal.SIGALRM, alarm_handler)
-                  for case_name, prompt_label, max_tokens, repeats, timeout_seconds in plan:
-                      prompt = prompts[prompt_label]
-                      prompt_tokens = encode_len(tokenizer, prompt)
-                      for repeat in range(1, repeats + 1):
-                          row = {'model_label': model_label, 'model_id': model_id, 'case_name': case_name, 'prompt_tokens': prompt_tokens, 'max_tokens': max_tokens, 'repeat': repeat, 'status': 'started'}
-                          result['cases'].append(row)
-                          write_outputs(result)
-                          sample_memory(f'before_{model_label}_{case_name}_rep{repeat}')
-                          try:
-                              signal.alarm(timeout_seconds)
-                              case_start = time.perf_counter()
-                              output = generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=False)
-                              elapsed = time.perf_counter() - case_start
-                              signal.alarm(0)
-                              sample_memory(f'after_{model_label}_{case_name}_rep{repeat}')
-                              tps = round(max_tokens / elapsed, 4) if elapsed > 0 else None
-                              row.update({'status': 'passed', 'elapsed_seconds': round(elapsed, 4), 'requested_tps': tps, 'output_tokens': encode_len(tokenizer, str(output)), 'output_preview': str(output)[:400]})
-                              if tps is not None:
-                                  case_values.append(tps)
-                              log(f"CASE_PASS model={model_label} case={case_name} seconds={row['elapsed_seconds']} tps={row['requested_tps']}")
-                          except BaseException as exc:
-                              signal.alarm(0)
-                              sample_memory(f'error_{model_label}_{case_name}_rep{repeat}')
-                              row.update({'status': 'error', 'error': repr(exc), 'traceback': traceback.format_exc()})
-                              log(f'CASE_ERROR model={model_label} case={case_name} error={exc!r}')
-                          write_outputs(result)
-                  if case_values:
-                      model_result['best_requested_tps'] = max(case_values)
-                      model_result['avg_requested_tps'] = round(statistics.mean(case_values), 4)
-                  model_result['passed_cases'] = sum(1 for row in result['cases'] if row.get('model_label') == model_label and row.get('status') == 'passed')
-                  model_result['total_cases'] = sum(1 for row in result['cases'] if row.get('model_label') == model_label)
-                  model_result['status'] = 'finished'
-                  write_outputs(result)
-                  try:
-                      del model
-                      del tokenizer
-                      gc.collect()
-                      if hasattr(mx, 'metal') and hasattr(mx.metal, 'clear_cache'):
-                          mx.metal.clear_cache()
-                  except Exception:
-                      pass
-                  sample_memory(f'after_cleanup_{model_label}')
-              except BaseException as exc:
-                  model_result['status'] = 'error'
-                  model_result['error'] = repr(exc)
-                  model_result['traceback'] = traceback.format_exc()
-                  log(f'MODEL_ERROR model={model_label} id={model_id} error={exc!r}')
-                  sample_memory(f'model_error_{model_label}')
-                  write_outputs(result)
-
-          for path in (LOG, SAMPLES):
-              path.write_text('', encoding='utf-8')
+          for p in (OUT_MD, OUT_JSON, OUT_CSV, LOG):
+              p.write_text('', encoding='utf-8')
 
           result = {
               'status': 'started',
               'started_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
               'github_sha': os.environ.get('GITHUB_SHA'),
               'github_run_id': os.environ.get('GITHUB_RUN_ID'),
-              'github_run_number': os.environ.get('GITHUB_RUN_NUMBER'),
               'runner': os.environ.get('RUNNER_NAME'),
               'runner_os': os.environ.get('RUNNER_OS'),
               'runner_arch': os.environ.get('RUNNER_ARCH'),
               'platform': platform.platform(),
               'python_version': sys.version.replace('\n', ' '),
               'macos_version': sh(['sw_vers']),
-              'sysctl_hw': sh(['bash', '-lc', 'sysctl -n hw.memsize hw.ncpu hw.optional.arm64 2>/dev/null || true']),
+              'dataset_urls': {d['id']: d['url'] for d in DATASETS},
               'models': [],
-              'cases': [],
+              'samples': [],
+              'evaluations': [],
+              'notes': ['Scores are lightweight lexical checks against reference answers, not a full human/LLM judge.'],
           }
-          write_outputs(result)
-          threading.Thread(target=monitor_loop, daemon=True).start()
+          save(result)
+
           try:
-              api = HfApi()
-              log('Resolving Qwen3.5 baseline model')
-              baseline_id, resolution_method, resolution_details = resolve_qwen_baseline(api)
-              result['baseline_resolution'] = {'baseline_id': baseline_id, 'method': resolution_method, 'details': resolution_details}
-              write_outputs(result)
-              benchmark_model('qwopus3.5_9b_4bit_mlx', QWOPUS_MODEL, api, result)
-              if baseline_id:
-                  benchmark_model('qwen3.5_9b_4bit_mlx', baseline_id, api, result)
-              else:
-                  result['models'].append({'label': 'qwen3.5_9b_4bit_mlx', 'model_id': None, 'status': 'not_found'})
-                  write_outputs(result)
+              samples = build_samples()
+              result['samples'] = samples
+              save(result)
+              for model_spec in MODELS:
+                  msum = {'label': model_spec['label'], 'id': model_spec['id'], 'status': 'started'}
+                  result['models'].append(msum)
+                  save(result)
+                  try:
+                      log('Loading model ' + model_spec['label'] + ': ' + model_spec['id'])
+                      gen, backend, load_errors = load_generator(model_spec)
+                      msum['backend'] = backend
+                      msum['load_errors_before_success'] = load_errors
+                      msum['status'] = 'loaded'
+                      save(result)
+                      scores = []
+                      hits = []
+                      for sample in samples:
+                          prompt = 'Answer the following question. Keep the final answer concise.\n\n' + sample['question']
+                          row = {
+                              'model_label': model_spec['label'],
+                              'model_id': model_spec['id'],
+                              'dataset_id': sample['dataset_id'],
+                              'question': sample['question'],
+                              'reference': sample['reference'],
+                              'status': 'started',
+                          }
+                          result['evaluations'].append(row)
+                          save(result)
+                          try:
+                              t0 = time.perf_counter()
+                              pred = gen(prompt, MAX_NEW_TOKENS)
+                              elapsed = time.perf_counter() - t0
+                              f1 = token_f1(pred, sample['reference'])
+                              hit = contains_answer(pred, sample['reference'])
+                              row.update({'status': 'passed', 'elapsed_seconds': round(elapsed, 4), 'prediction': str(pred), 'token_f1': f1, 'contains_answer': hit})
+                              scores.append(f1)
+                              hits.append(1 if hit else 0)
+                              log(f"PASS model={model_spec['label']} dataset={sample['dataset_id']} f1={f1} hit={hit} seconds={elapsed:.2f}")
+                          except Exception as e:
+                              row.update({'status': 'error', 'error': repr(e), 'traceback': traceback.format_exc()})
+                              log(f"ERROR model={model_spec['label']} dataset={sample['dataset_id']} {e!r}")
+                          save(result)
+                      msum['status'] = 'finished'
+                      msum['cases'] = len([r for r in result['evaluations'] if r.get('model_label') == model_spec['label']])
+                      msum['avg_token_f1'] = round(statistics.mean(scores), 4) if scores else None
+                      msum['contains_answer_rate'] = round(sum(hits) / len(hits), 4) if hits else None
+                      save(result)
+                      del gen
+                      gc.collect()
+                  except Exception as e:
+                      msum['status'] = 'error'
+                      msum['error'] = repr(e)
+                      msum['traceback'] = traceback.format_exc()
+                      log(f"MODEL_ERROR {model_spec['label']} {e!r}")
+                      save(result)
               result['status'] = 'finished'
-              write_outputs(result)
-          except BaseException as exc:
-              result['status'] = 'error_or_interrupted'
-              result['error'] = repr(exc)
+              save(result)
+          except Exception as e:
+              result['status'] = 'error'
+              result['error'] = repr(e)
               result['traceback'] = traceback.format_exc()
-              log('TOP_LEVEL_ERROR ' + repr(exc))
-              sample_memory('top_level_error')
-              write_outputs(result)
-          finally:
-              stop.set()
-              result['finished_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-              sample_memory('finally')
-              write_outputs(result)
-              log('Wrote comparison benchmark outputs')
+              log('TOP_LEVEL_ERROR ' + repr(e))
+              save(result)
           PY
-          PYTHONUNBUFFERED=1 python compare_qwopus_qwen35_mlx.py
-          echo "python_exit=$?" | tee -a qwopus-vs-qwen35-9b-4bit-mlx.log
+          PYTHONUNBUFFERED=1 python eval_qwopus_qwen_datasets.py
+          echo "python_exit=$?" | tee -a qwopus-qwen-dataset-eval.log
           exit 0
 
-      - name: Upload comparison artifacts
+      - name: Upload dataset evaluation artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: qwopus-vs-qwen35-mlx-comparison-results
+          name: qwopus-qwen-dataset-eval-results
           path: |
-            qwopus-vs-qwen35-9b-4bit-mlx-results.md
-            qwopus-vs-qwen35-9b-4bit-mlx-results.json
-            qwopus-vs-qwen35-9b-4bit-mlx-results.csv
-            qwopus-vs-qwen35-9b-4bit-mlx.log
-            qwopus-vs-qwen35-9b-4bit-mlx-memory-samples.jsonl
+            qwopus-qwen-dataset-eval-results.md
+            qwopus-qwen-dataset-eval-results.json
+            qwopus-qwen-dataset-eval-results.csv
+            qwopus-qwen-dataset-eval.log
           if-no-files-found: warn
 
-      - name: Commit comparison results back to repo
+      - name: Commit dataset evaluation results back to repo
         if: always()
         shell: bash
         run: |
           set +e
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add qwopus-vs-qwen35-9b-4bit-mlx-results.md qwopus-vs-qwen35-9b-4bit-mlx-results.json qwopus-vs-qwen35-9b-4bit-mlx-results.csv qwopus-vs-qwen35-9b-4bit-mlx.log qwopus-vs-qwen35-9b-4bit-mlx-memory-samples.jsonl || true
-          git commit -m "Write Qwopus vs Qwen3.5 MLX comparison results [skip ci]" || echo "No comparison result changes to commit"
+          git add qwopus-qwen-dataset-eval-results.md qwopus-qwen-dataset-eval-results.json qwopus-qwen-dataset-eval-results.csv qwopus-qwen-dataset-eval.log || true
+          git commit -m "Write Qwopus vs Qwen dataset evaluation results [skip ci]" || echo "No dataset eval result changes to commit"
           git pull --rebase || true
-          git push || echo "No comparison result push performed"
+          git push || echo "No dataset eval result push performed"
